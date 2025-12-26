@@ -9,3 +9,4 @@ __pycache__/
 *.ogg
 *.log
 *.csv
+downloads.db
