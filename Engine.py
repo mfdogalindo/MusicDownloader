@@ -3,22 +3,18 @@ from yt_dlp.utils import DownloadError
 import os
 import time
 import random
-import datetime
 from Logger import ConsoleLogger
-
-# Importar el nuevo gestor de DB
 from Database import DatabaseManager
 
 class DownloadEngine:
     def __init__(self, log_callback):
         self.log = log_callback
         self.stop_flag = False
-        self.db = DatabaseManager() # Inicializamos la DB
+        self.db = DatabaseManager()
         self.is_paused_by_limit = False
 
     def request_stop(self):
         self.stop_flag = True
-        # Si estaba en espera por rate limit, esto ayudará a salir del bucle de espera
         self.is_paused_by_limit = False 
 
     def run(self, url, path, config):
@@ -26,10 +22,8 @@ class DownloadEngine:
         cookie = config.get('cookie_path')
         name_template = config.get('name_template', '%(title)s')
         
-        # 1. Extracción PRELIMINAR (Flat) para llenar la DB
-        ydl_opts_list = {
-            'extract_flat': True, 'quiet': True, 'ignoreerrors': True,
-        }
+        # 1. Extracción (Flat)
+        ydl_opts_list = { 'extract_flat': True, 'quiet': True, 'ignoreerrors': True }
         if cookie: ydl_opts_list['cookiefile'] = cookie
 
         playlist_id = None
@@ -38,61 +32,71 @@ class DownloadEngine:
             self.log("--- SINCRONIZANDO CON BASE DE DATOS... ---")
             with yt_dlp.YoutubeDL(ydl_opts_list) as ydl:
                 info = ydl.extract_info(url, download=False)
-                
                 pl_title = info.get('title', 'Lista Sin Titulo')
-                # Registrar Playlist en DB
                 playlist_id = self.db.get_or_create_playlist(url, pl_title)
                 
-                entries = []
-                if 'entries' in info:
-                    entries = list(info['entries'])
-                    self.log(f"Playlist encontrada: {len(entries)} elementos.")
-                else:
-                    entries = [info]
-                
-                # Guardar videos en DB (solo los nuevos)
-                added = self.db.add_videos_to_playlist(playlist_id, entries)
-                self.log(f"Nuevos videos agregados a la cola: {added}")
+                entries = info.get('entries', [info]) if 'entries' in info else [info]
+                added = self.db.add_videos_to_playlist(playlist_id, list(entries))
+                self.log(f"Nuevos videos en cola: {added}")
 
         except Exception as e:
             self.log(f"Error al analizar URL: {e}")
             return
 
-        # 2. Bucle de Descarga basado en DB
-        # Obtenemos solo los pendientes
+        # 2. Descarga
         pending_videos = self.db.get_pending_videos(playlist_id)
         total_pending = len(pending_videos)
         
         if total_pending == 0:
-            self.log("¡Todos los videos de esta lista ya están descargados!")
+            self.log("¡Todos los videos registrados están marcados como completados!")
             return
 
-        self.log(f"--- INICIANDO DESCARGA DE {total_pending} VIDEOS PENDIENTES ---")
+        self.log(f"--- PROCESANDO {total_pending} VIDEOS PENDIENTES ---")
 
-        for i, (db_id, title, video_url) in enumerate(pending_videos):
+        # pending_videos ahora trae: (db_id, title, url, video_id, filepath_antiguo)
+        for i, (db_id, title, video_url, vid_id, old_path) in enumerate(pending_videos):
             if self.stop_flag:
-                self.log("⛔ PROCESO DETENIDO POR EL USUARIO.")
+                self.log("⛔ DETENIDO POR USUARIO.")
                 break
 
-            # --- Lógica Anti-Bloqueo (Rate Limit) ---
-            # Si estamos en 'modo pausa' por rate limit, el bucle debe gestionar la espera
+            # --- VERIFICACIÓN DE ARCHIVO EXISTENTE (Lógica Anti-Duplicados) ---
+            # A veces la DB dice PENDING pero el archivo ya está ahí (crash anterior, etc.)
+            # Intentamos adivinar si existe buscando el ID en la carpeta
+            already_downloaded = False
+            for f_name in os.listdir(path):
+                # Si el ID del video está en el nombre del archivo y es de audio
+                if vid_id in f_name and any(f_name.endswith(ext) for ext in ['.mp3', '.m4a', '.wav', '.flac']):
+                    full_path = os.path.join(path, f_name)
+                    self.log(f"✨ El archivo ya existe: {f_name}. Marcando como completado.")
+                    self.db.update_video_status(db_id, "COMPLETED", filepath=full_path)
+                    already_downloaded = True
+                    break
+            
+            if already_downloaded:
+                continue
+
+            # --- MANEJO DE RATE LIMIT ---
             while self.is_paused_by_limit:
                 if self.stop_flag: break
-                self.log("⏳ Esperando liberación de IP (Rate Limit)...")
-                # Esperamos bloques de 1 minuto para no congelar la UI si el usuario cancela
+                self.log("⏳ Pausa por Rate Limit...")
                 for _ in range(60): 
                     if self.stop_flag: break
                     time.sleep(1)
-                
-                # Intentamos reanudar tras la espera
                 self.is_paused_by_limit = False 
 
-            self.log(f"\n[{i+1}/{total_pending}] Procesando: {title}")
+            self.log(f"\n[{i+1}/{total_pending}] Descargando: {title}")
 
-            # Configuración yt-dlp
+            # Variable para capturar el nombre final del archivo
+            final_filename = [None] 
+
+            def progress_hook(d):
+                if d['status'] == 'finished':
+                    final_filename[0] = d.get('filename')
+
             ydl_opts_down = {
                 'format': 'bestaudio/best',
-                'outtmpl': os.path.join(path, f'{name_template}.%(ext)s'),
+                # Agregamos el ID al nombre para facilitar la detección futura de duplicados
+                'outtmpl': os.path.join(path, f'{name_template} [%(id)s].%(ext)s'),
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio', 
                     'preferredcodec': config.get('format'), 
@@ -100,53 +104,50 @@ class DownloadEngine:
                 }, {'key': 'FFmpegMetadata', 'add_metadata': True}],
                 'quiet': True, 'no_warnings': True,
                 'logger': ConsoleLogger(self.log),
+                'progress_hooks': [progress_hook] # Hook para capturar nombre
             }
             if cookie: ydl_opts_down['cookiefile'] = cookie
 
-            # --- INICIO LÓGICA DE REINTENTOS ---
+            # Intentos
             max_retries = 3
             attempt = 0
-            success = False
-
+            
             while attempt < max_retries:
                 if self.stop_flag: break
                 attempt += 1
                 
-                # Intentar descarga
                 status, err_msg = self._download_safe(ydl_opts_down, video_url)
                 
                 if status == "OK":
-                    self.db.update_video_status(db_id, "COMPLETED", filepath="Ok")
-                    success = True
-                    break # Salir del bucle de reintentos
+                    # Si yt-dlp convirtió el archivo (ej. webm -> mp3), el filename del hook
+                    # podría tener la extensión vieja. Ajustamos la extensión:
+                    saved_path = final_filename[0] if final_filename[0] else "Unknown"
+                    target_ext = config.get('format')
+                    if saved_path != "Unknown":
+                        base, _ = os.path.splitext(saved_path)
+                        # Predecimos el nombre final post-conversión
+                        saved_path = f"{base}.{target_ext}"
+
+                    self.db.update_video_status(db_id, "COMPLETED", filepath=saved_path)
+                    break 
                 
                 elif status == "RATE_LIMIT":
-                    self.log("⚠️ DETECTADO BLOQUEO DE YOUTUBE (429).")
-                    self.log("💤 El sistema entrará en pausa automática por 5 minutos.")
+                    self.log("⚠️ BLOQUEO DE YOUTUBE DETECTADO (429).")
                     self.is_paused_by_limit = True
                     self._wait_cooldown(minutes=5)
-                    # Si hay rate limit, rompemos el bucle de reintentos de este video
-                    # para que el bucle principal maneje la pausa al inicio del siguiente ciclo
-                    # (o reintente este mismo si la lógica lo permitiera, pero aquí pasamos al siguiente).
                     break 
 
                 else:
-                    # Caso ERROR (Ej: Video Unavailable)
                     if attempt < max_retries:
-                        self.log(f"⚠️ Error en intento {attempt}/{max_retries}: {err_msg}")
-                        self.log("🔄 Reintentando en 5 segundos...")
+                        self.log(f"⚠️ Reintentando ({attempt}/{max_retries})...")
                         time.sleep(5)
                     else:
-                        # Si llegamos aquí, se agotaron los intentos
-                        self.log(f"❌ Falló tras {max_retries} intentos. Saltando video.")
+                        self.log(f"❌ Error final: {err_msg}")
                         self.db.update_video_status(db_id, "ERROR", error_msg=err_msg)
             
-            # --- FIN LÓGICA DE REINTENTOS ---
-            
-            # Pausa humana normal entre videos exitosos (o saltados)
             time.sleep(random.uniform(2, 5))
 
-        self.log("\n--- TAREA FINALIZADA O PAUSADA ---")
+        self.log("\n--- TAREA FINALIZADA ---")
 
     def _download_safe(self, opts, url):
         try:
@@ -155,19 +156,16 @@ class DownloadEngine:
                 return "OK", ""
         except DownloadError as e:
             msg = str(e)
-            # Detección de palabras clave de bloqueo
-            if "HTTP Error 429" in msg or "rate-limited" in msg or "Try again later" in msg:
+            if "HTTP Error 429" in msg or "rate-limited" in msg:
                 return "RATE_LIMIT", msg
             return "ERROR", msg
         except Exception as e:
             return "CRITICAL", str(e)
 
     def _wait_cooldown(self, minutes):
-        """Espera activa que permite cancelar desde la UI"""
         seconds = minutes * 60
         for s in range(seconds):
             if self.stop_flag: return
             if s % 60 == 0:
-                remaining = minutes - (s // 60)
-                self.log(f"⏳ Enfriando motor... {remaining} minutos restantes.")
+                self.log(f"⏳ Enfriando... {minutes - (s // 60)} min restantes.")
             time.sleep(1)
