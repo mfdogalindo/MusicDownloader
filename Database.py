@@ -8,7 +8,16 @@ class DatabaseManager:
 
     def create_tables(self):
         cursor = self.conn.cursor()
-        # Tabla de Playlists / Sesiones
+        
+        # 1. Tabla de Configuración (NUEVA)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY, 
+                value TEXT
+            )
+        ''')
+
+        # Tabla de Playlists
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS playlists (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -18,6 +27,7 @@ class DatabaseManager:
                 last_updated TIMESTAMP
             )
         ''')
+        
         # Tabla de Videos
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS videos (
@@ -35,6 +45,20 @@ class DatabaseManager:
         ''')
         self.conn.commit()
 
+    # --- MÉTODOS DE CONFIGURACIÓN ---
+    def save_setting(self, key, value):
+        """Guarda una configuración persistente."""
+        cursor = self.conn.cursor()
+        cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (str(key), str(value)))
+        self.conn.commit()
+
+    def load_settings(self):
+        """Carga todas las configuraciones al inicio."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT key, value FROM settings")
+        return {row[0]: row[1] for row in cursor.fetchall()}
+
+    # --- MÉTODOS DE PLAYLIST Y VIDEO ---
     def get_or_create_playlist(self, url, title="Unknown"):
         cursor = self.conn.cursor()
         cursor.execute("SELECT id FROM playlists WHERE url = ?", (url,))
@@ -49,14 +73,12 @@ class DatabaseManager:
             return cursor.lastrowid
 
     def add_videos_to_playlist(self, playlist_id, entries):
-        """Agrega videos a la DB solo si no existen ya para esa playlist."""
         cursor = self.conn.cursor()
         count = 0
         for entry in entries:
             if not entry: continue
             vid_id = entry.get('id')
             title = entry.get('title', 'Unknown')
-            # Construir URL
             web_url = entry.get('url') or entry.get('webpage_url')
             if not web_url and vid_id:
                 web_url = f"https://www.youtube.com/watch?v={vid_id}"
@@ -68,15 +90,19 @@ class DatabaseManager:
                 ''', (playlist_id, vid_id, title, web_url))
                 count += 1
             except sqlite3.IntegrityError:
-                # El video ya existe en esta playlist, lo ignoramos
-                pass
+                pass # Ya existe
         self.conn.commit()
         return count
 
     def get_pending_videos(self, playlist_id):
         cursor = self.conn.cursor()
-        # Retorna videos que están PENDING o que dieron ERROR (para reintentar)
-        cursor.execute("SELECT id, title, url FROM videos WHERE playlist_id = ? AND status IN ('PENDING', 'ERROR_DL')", (playlist_id,))
+        # CORRECCIÓN: Ahora incluimos 'ERROR' para que se reintenten los fallidos,
+        # y traemos el 'video_id' para verificar existencia física.
+        cursor.execute('''
+            SELECT id, title, url, video_id 
+            FROM videos 
+            WHERE playlist_id = ? AND status IN ('PENDING', 'ERROR', 'ERROR_DL')
+        ''', (playlist_id,))
         return cursor.fetchall()
 
     def update_video_status(self, db_id, status, error_msg="", filepath=""):
